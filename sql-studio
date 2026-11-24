@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# sql-studio — abre SQL Studio en una ventana de Chromium.
+#
+#   ./sql-studio              arranca el servidor si hace falta y abre la ventana
+#   ./sql-studio --stop       para el servidor
+#   ./sql-studio --status     estado del servidor
+#   ./sql-studio --foreground arranca en primer plano (para depurar)
+#   ./sql-studio --no-open    solo arranca el servidor (http://127.0.0.1:8765)
+set -euo pipefail
+
+SELF="$(readlink -f -- "${BASH_SOURCE[0]}")"
+BASE="$(cd -- "$(dirname -- "$SELF")" && pwd)"
+
+# Puerto y credenciales del .env del repo (lo genera ./install.sh).
+if [ -f "$BASE/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$BASE/.env"
+  set +a
+fi
+
+PORT="${SQL_STUDIO_PORT:-8765}"
+HOST="127.0.0.1"
+URL="http://$HOST:$PORT/"
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/sql-studio-$PORT.pid"
+LOGFILE="${XDG_RUNTIME_DIR:-/tmp}/sql-studio-$PORT.log"
+
+info() { printf '\033[32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33maviso:\033[0m %s\n' "$*" >&2; }
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+healthy() {
+  python3 - "$URL" <<'PY' >/dev/null 2>&1
+import json, sys, urllib.request
+try:
+    with urllib.request.urlopen(sys.argv[1] + "api/health", timeout=2) as r:
+        sys.exit(0 if json.load(r).get("ok") else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+server_pid() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid
+  pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null && printf '%s' "$pid"
+}
+
+start_server() {
+  if healthy; then
+    info "Servidor ya en marcha en $URL"
+    return 0
+  fi
+  command -v docker >/dev/null || die "no encuentro docker."
+  docker inspect -f '{{.State.Running}}' sql-lab 2>/dev/null | grep -q true \
+    || warn "el contenedor 'sql-lab' no está en marcha; ejecuta ./sql-lab start"
+
+  # setsid: sobrevive al cierre de la terminal/atajo que lo lanzó
+  SQL_STUDIO_PORT="$PORT" setsid nohup python3 "$BASE/app/server.py" >"$LOGFILE" 2>&1 &
+  local pid=$!
+  printf '%s' "$pid" >"$PIDFILE"
+
+  for _ in $(seq 1 60); do
+    healthy && { info "SQL Studio en $URL"; return 0; }
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.25
+  done
+  tail -n 20 "$LOGFILE" >&2 || true
+  die "el servidor no arrancó (log: $LOGFILE)"
+}
+
+open_window() {
+  local -a browsers=()
+  command -v chromium >/dev/null && browsers+=(chromium)
+  command -v google-chrome-stable >/dev/null && browsers+=(google-chrome-stable)
+  command -v firefox >/dev/null && browsers+=(firefox)
+
+  for browser in "${browsers[@]}"; do
+    case "$browser" in
+      chromium|google-chrome-stable)
+        "$browser" --app="$URL" --class=sql-studio --name=sql-studio \
+          --window-size=1500,950 --user-data-dir="${XDG_CACHE_HOME:-$HOME/.cache}/sql-studio" \
+          >/dev/null 2>&1 &
+        return 0
+        ;;
+      firefox)
+        "$browser" --new-window "$URL" >/dev/null 2>&1 &
+        return 0
+        ;;
+    esac
+  done
+  command -v xdg-open >/dev/null && { xdg-open "$URL" >/dev/null 2>&1 & return 0; }
+  warn "no encuentro navegador; abre $URL a mano."
+}
+
+cmd_stop() {
+  local pid
+  if pid="$(server_pid)"; then
+    kill "$pid" 2>/dev/null || true
+    rm -f "$PIDFILE"
+    info "Servidor detenido."
+  else
+    info "El servidor no estaba en marcha."
+    rm -f "$PIDFILE"
+  fi
+}
+
+cmd_status() {
+  if healthy; then
+    info "En marcha en $URL (pid $(server_pid || echo '?'))"
+  else
+    info "Detenido."
+  fi
+}
+
+case "${1:-start}" in
+  start) start_server; open_window ;;
+  --no-open) start_server ;;
+  --foreground) SQL_STUDIO_PORT="$PORT" exec python3 "$BASE/app/server.py" ;;
+  --stop) cmd_stop ;;
+  --status) cmd_status ;;
+  --help|-h) sed -n '2,9p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *) die "opción desconocida: $1 (usa --help)" ;;
+esac

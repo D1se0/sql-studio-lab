@@ -1,0 +1,31 @@
+name: Propuesta de mejora
+description: Una idea para SQL Studio Lab
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problema o necesidad
+      description: ¿Qué te resulta incómodo o imposible ahora?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Propuesta
+      description: Cómo te gustaría que funcionara. Bocetos o capturas ayudan.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternativas consideradas
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Alcance
+      options:
+        - label: Estoy dispuesto/a a enviar un PR
+        - label: Afecta solo a la interfaz
+        - label: Requiere cambios en la API

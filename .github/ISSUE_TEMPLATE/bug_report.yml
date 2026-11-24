@@ -1,0 +1,55 @@
+name: Informe de error
+description: Algo no funciona como debería
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Gracias por el informe. No incluyas contraseñas, `.env`, volúmenes ni
+        datos personales en capturas o logs.
+  - type: textarea
+    id: what
+    attributes:
+      label: Qué ocurre
+      description: Describe el comportamiento observado y el esperado.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Pasos para reproducirlo
+      placeholder: |
+        1. ./install.sh --demo
+        2. Abrir sakila → film
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Versión / commit
+      placeholder: "v2.1.0 o hash"
+  - type: dropdown
+    id: area
+    attributes:
+      label: Zona afectada
+      options:
+        - Interfaz (editor, pestañas, inspector)
+        - Mapa de esquema
+        - API / backend
+        - Docker / instalación
+        - CLI sql-lab
+        - Documentación
+        - Otro
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs relevantes
+      description: Salida de `./install.sh --status`, `docker logs sql-lab --tail 50` o la consola del navegador.
+      render: shell
+  - type: input
+    id: system
+    attributes:
+      label: Sistema
+      placeholder: "Arch Linux, Docker 29, Chromium 157, Python 3.14"

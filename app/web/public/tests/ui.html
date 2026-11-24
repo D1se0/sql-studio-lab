@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<title>Pruebas UI · SQL Studio</title>
+<style>
+  body { margin: 0; background: #080a11; color: #cbd5e1; font: 13px/1.55 "JetBrainsMono Nerd Font", ui-monospace, monospace; overflow: hidden; }
+  #log > div { padding: 1px 0; }
+  .pass { color: #4ade80; }
+  .fail { color: #f87171; font-weight: 700; }
+  .info { color: #94a3b8; }
+  #summary {
+    position: fixed; left: 8px; bottom: 8px; z-index: 20;
+    padding: 5px 10px; border-radius: 8px;
+    background: rgba(8, 10, 17, 0.9); border: 1px solid #273244;
+    font-size: 14px; color: #e2e8f0;
+  }
+  #log {
+    position: fixed; right: 6px; top: 6px; z-index: 10;
+    width: 350px; max-height: 640px; overflow: auto;
+    padding: 8px 10px; border-radius: 10px;
+    background: rgba(8, 10, 17, 0.88); border: 1px solid #273244;
+    font-size: 10.5px;
+  }
+  iframe { position: fixed; left: 6px; top: 6px; width: 1420px; height: 880px; border: 1px solid #273244; border-radius: 10px; display: block; }
+</style>
+</head>
+<body>
+<div id="summary">ejecutando…</div>
+<div id="log"></div>
+<iframe id="frame" src="/?test=1"></iframe>
+<script>
+const frame = document.getElementById("frame");
+const logBox = document.getElementById("log");
+const summary = document.getElementById("summary");
+let passed = 0;
+let failed = 0;
+
+const out = (cls, text) => {
+  const line = document.createElement("div");
+  line.className = cls;
+  line.textContent = text;
+  logBox.appendChild(line);
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const doc = () => frame.contentDocument;
+const win = () => frame.contentWindow;
+const q = (selector) => doc().querySelector(selector);
+const qa = (selector) => Array.from(doc().querySelectorAll(selector));
+const text = (selector) => q(selector)?.textContent ?? "";
+
+async function waitFor(fn, label, timeout = 20000) {
+  const started = Date.now();
+  let lastError = null;
+  while (Date.now() - started < timeout) {
+    try {
+      const value = fn();
+      if (value) return value;
+    } catch (problem) {
+      lastError = problem;
+    }
+    await sleep(90);
+  }
+  throw new Error(`tiempo agotado esperando ${label}${lastError ? ` (${lastError.message})` : ""}`);
+}
+
+async function waitGone(selector, label = selector) {
+  await waitFor(() => !q(selector), `que desaparezca ${label}`);
+}
+
+function fire(element) {
+  if (typeof element.click === "function") {
+    element.click();
+  } else {
+    const view = win();
+    element.dispatchEvent(new view.MouseEvent("click", { bubbles: true }));
+  }
+}
+
+async function click(selector) {
+  const element = await waitFor(() => q(selector), `el elemento ${selector}`);
+  fire(element);
+  await sleep(130);
+}
+
+function setInput(selector, value) {
+  const view = win();
+  const input = q(selector);
+  const setter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, "value").set;
+  setter.call(input, value);
+  input.dispatchEvent(new view.Event("input", { bubbles: true }));
+}
+
+function setSelect(selector, value) {
+  const view = win();
+  const select = q(selector);
+  const setter = Object.getOwnPropertyDescriptor(view.HTMLSelectElement.prototype, "value").set;
+  setter.call(select, value);
+  select.dispatchEvent(new view.Event("change", { bubbles: true }));
+}
+
+async function press(key, options = {}) {
+  const view = win();
+  view.dispatchEvent(
+    new view.KeyboardEvent("keydown", {
+      key,
+      bubbles: true,
+      cancelable: true,
+      ...options,
+    }),
+  );
+  await sleep(160);
+}
+
+async function setSql(sql) {
+  const view = await waitFor(() => win().__cmView, "el editor CodeMirror");
+  view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: sql } });
+  view.focus();
+  await sleep(220);
+}
+
+async function check(name, fn) {
+  try {
+    await fn();
+    passed += 1;
+    out("pass", `PASS · ${name}`);
+  } catch (problem) {
+    failed += 1;
+    out("fail", `FAIL · ${name} → ${problem && problem.message ? problem.message : problem}`);
+  }
+}
+
+const closeInspector = () => click('[data-testid="table-modal"] [data-testid="modal-close"]');
+
+async function expandSakila() {
+  const open = qa('[data-testid="table-node"]').length;
+  if (open === 0) {
+    await click('[data-testid="db-node"][data-db="sakila"]');
+  }
+  await waitFor(() => qa('[data-testid="table-node"]').length > 5, "las tablas de sakila");
+}
+
+async function openFilm() {
+  await expandSakila();
+  await click('[data-testid="table-node"][data-table="film"]');
+  await waitFor(() => q('[data-testid="table-modal"]'), "el inspector de film");
+  await waitFor(() => qa('[data-testid="table-row"]').length > 5, "las filas de film");
+}
+
+async function runQuery(sql, expectedCell) {
+  await setSql(sql);
+  await click('[data-testid="run-btn"]');
+  await waitFor(() => {
+    const cell = q(".data-grid tbody td");
+    return cell && cell.textContent === expectedCell;
+  }, `la celda ${expectedCell}`);
+}
+
+async function main() {
+  await waitFor(() => q('[data-testid="app"]') && q(".db-row"), "la aplicación");
+
+  /* ------------------------------------------------------------- árbol */
+  await check("el árbol lista todas las bases", () => {
+    const count = qa('[data-testid="db-node"]').length;
+    if (count < 9) throw new Error(`solo ${count} bases`);
+  });
+
+  await check("las estadísticas son números reales (sin NaN)", () => {
+    const values = qa(".stat-value").map((node) => node.textContent).join(" | ");
+    if (/NaN|undefined/.test(values)) throw new Error(values);
+    if (!/3\.2\d{2}\.\d{3}/.test(values)) throw new Error(`filas inesperadas: ${values}`);
+  });
+
+  await check("sakila se despliega y carga sus tablas", async () => {
+    await click('[data-testid="db-node"][data-db="sakila"]');
+    await waitFor(() => qa('[data-testid="table-node"]').length >= 16, "las tablas de sakila");
+    const names = qa('[data-testid="table-node"]').map((node) => node.dataset.table);
+    if (!names.includes("film") || !names.includes("rental")) {
+      throw new Error(`faltan tablas: ${names.slice(0, 6).join(", ")}`);
+    }
+  });
+
+  await check("el botón de plegar deja el árbol compacto", async () => {
+    await click('[data-testid="collapse-all"]');
+    await waitFor(() => qa('[data-testid="table-node"]').length === 0, "que no queden tablas a la vista");
+  });
+
+  await check("la búsqueda filtra tablas por nombre", async () => {
+    setInput('[data-testid="search-input"]', "film");
+    await waitFor(() => qa('[data-testid="table-node"]').length > 0, "resultados de búsqueda");
+    const names = qa('[data-testid="table-node"]').map((node) => node.dataset.table);
+    if (!names.every((name) => name.includes("film"))) {
+      throw new Error(`coladas: ${names.join(", ")}`);
+    }
+  });
+
+  await check("al limpiar la búsqueda vuelve el árbol plegado", async () => {
+    setInput('[data-testid="search-input"]', "");
+    await waitFor(() => qa('[data-testid="table-node"]').length === 0, "árbol plegado");
+  });
+
+  /* ----------------------------------------------------------- consultas */
+  await check("una consulta devuelve datos en la rejilla", async () => {
+    await runQuery("SELECT 42 AS respuesta;", "42");
+  });
+
+  await check("un error de MySQL muestra código 1146", async () => {
+    await setSql("SELECT * FROM sakila.tabla_que_no_existe;");
+    await click('[data-testid="run-btn"]');
+    await waitFor(() => {
+      const card = q('[data-testid="error-card"]');
+      return card && card.textContent.includes("1146");
+    }, "la tarjeta de error 1146");
+  });
+
+  await check("un SIGNAL muestra su SQLSTATE y mensaje", async () => {
+    await setSql("SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'popup de prueba';");
+    await click('[data-testid="run-btn"]');
+    await waitFor(() => {
+      const message = q('[data-testid="error-message"]');
+      return message && message.textContent.includes("popup de prueba");
+    }, "el mensaje del SIGNAL");
+    if (!text('[data-testid="error-card"]').includes("45000")) throw new Error("falta el SQLSTATE 45000");
+  });
+
+  await check("varias sentencias crean chips y se puede cambiar de resultado", async () => {
+    await setSql("SELECT 1 AS uno; SELECT 2 AS dos;");
+    await click('[data-testid="run-btn"]');
+    await waitFor(() => qa('[data-testid="stmt-chip"]').length === 2, "los dos chips");
+    qa('[data-testid="stmt-chip"]')[1].click();
+    await waitFor(() => {
+      const cell = q(".data-grid tbody td");
+      return cell && cell.textContent === "2";
+    }, "el resultado de la segunda sentencia");
+  });
+
+  await check("se abre y se cierra una pestaña nueva", async () => {
+    await click('[data-testid="new-tab"]');
+    await waitFor(() => qa('[data-testid="tab"]').length === 2, "dos pestañas");
+    qa('[data-testid="close-tab"]')[1].click();
+    await waitFor(() => qa('[data-testid="tab"]').length === 1, "una pestaña");
+  });
+
+  /* ------------------------------------------------------------ ficheros */
+  await check("guardar pide nombre y escribe el .sql en disco", async () => {
+    await setSql("-- guardado desde la prueba de interfaz\nSELECT 7 AS siete;\n");
+    await click('[data-testid="save-btn"]');
+    await waitFor(() => q('[data-testid="saveas-modal"]'), "el modal de guardado");
+    setInput('[data-testid="save-name"]', "ui_smoke.sql");
+    await sleep(120);
+    await click('[data-testid="save-confirm"]');
+    await waitFor(() => text('[data-testid="file-chip"]').includes("ui_smoke.sql"), "el nombre del fichero en la barra");
+    const response = await win().fetch("/api/file?name=ui_smoke.sql").then((r) => r.json());
+    if (!response.ok || !response.sql.includes("siete")) {
+      throw new Error("el fichero no está en sql/ o no tiene el contenido");
+    }
+  });
+
+  await check("el modal Abrir lista los .sql de la carpeta", async () => {
+    await click('[data-testid="open-file-btn"]');
+    await waitFor(() => q('[data-testid="open-modal"]'), "el modal de apertura");
+    await waitFor(
+      () => qa('[data-testid="file-row"]').some((row) => row.dataset.file === "ui_smoke.sql"),
+      "el fichero guardado en la lista",
+    );
+    await click('[data-testid="open-modal"] [data-testid="modal-close"]');
+  });
+
+  await check("el .sql de prueba se borra y no deja basura", async () => {
+    const response = await win().fetch("/api/file?name=ui_smoke.sql", { method: "DELETE" });
+    if (!response.ok) throw new Error(`no se pudo borrar (${response.status})`);
+    const again = await win().fetch("/api/file?name=ui_smoke.sql", { method: "DELETE" });
+    if (again.status !== 404) throw new Error(`el segundo borrado devolvió ${again.status}`);
+  });
+
+  await check("el modal de importación muestra la zona de arrastre", async () => {
+    await click('[data-testid="import-btn"]');
+    await waitFor(() => q('[data-testid="dropzone"]'), "la zona de arrastre");
+    await click('[data-testid="import-modal"] [data-testid="modal-close"]');
+  });
+
+  await check("el modal de ayuda resume los atajos nuevos", async () => {
+    await click('[data-testid="help-btn"]');
+    const keys = await waitFor(() => {
+      const all = qa('[data-testid="help-modal"] kbd');
+      return all.length >= 10 ? all : null;
+    }, "los atajos");
+    const content = keys.map((node) => node.textContent).join(" ");
+    if (!content.includes("Ctrl + P") || !content.includes("Ctrl + Shift + M")) {
+      throw new Error(`faltan atajos nuevos: ${content}`);
+    }
+    await click('[data-testid="help-modal"] .btn.primary');
+  });
+
+  await check("formatear pone las cláusulas en líneas separadas", async () => {
+    await setSql("select id,nombre from clientes where activo=1 and pais='ES'");
+    await click('[data-testid="format-btn"]');
+    await waitFor(() => {
+      const value = win().__cmView.state.doc.toString();
+      return value.includes("SELECT") && value.includes("\nFROM") && value.includes("\nWHERE");
+    }, "el SQL formateado");
+  });
+
+  /* ----------------------------------------------------------- inspector */
+  await check("abrir una tabla no crea pestañas y muestra el inspector", async () => {
+    const before = qa('[data-testid="tab"]').length;
+    await openFilm();
+    const after = qa('[data-testid="tab"]').length;
+    if (after !== before) throw new Error(`pestañas: ${before} → ${after}`);
+    if (!text('[data-testid="table-page-info"]').includes("Página 1")) {
+      throw new Error(text('[data-testid="table-page-info"]'));
+    }
+    if (!text('[data-testid="table-total"]').includes("1000")) {
+      throw new Error(text('[data-testid="table-total"]'));
+    }
+  });
+
+  await check("el inspector pagina los datos", async () => {
+    const first = text('[data-testid="table-row"] td:nth-child(3)');
+    await click('[data-testid="table-next"]');
+    await waitFor(
+      () =>
+        text('[data-testid="table-page-info"]').includes("Página 2") &&
+        text('[data-testid="table-row"] td:nth-child(3)') !== first,
+      "la segunda página",
+    );
+    await click('[data-testid="table-prev"]');
+    await waitFor(() => text('[data-testid="table-page-info"]').includes("Página 1"), "volver a la página 1");
+  });
+
+  await check("ordenar por una columna recarga la primera página", async () => {
+    await click('[data-testid="table-next"]');
+    await waitFor(() => text('[data-testid="table-page-info"]').includes("Página 2"), "página 2");
+    await click('[data-testid="table-col"][data-column="title"]');
+    await waitFor(
+      () =>
+        text('[data-testid="table-page-info"]').includes("Página 1") &&
+        text('[data-testid="table-row"] td:nth-child(3)') === "ACADEMY DINOSAUR",
+      "orden alfabético en la página 1",
+    );
+  });
+
+  await check("el filtro busca en todas las columnas", async () => {
+    setInput('[data-testid="table-search"]', "ACADEMY");
+    await waitFor(
+      () =>
+        text('[data-testid="table-total"]').includes("filtradas") &&
+        qa('[data-testid="table-row"]').length >= 1,
+      "los resultados filtrados",
+    );
+    if (!text('[data-testid="table-row"] td:nth-child(3)').includes("ACADEMY")) {
+      throw new Error(text('[data-testid="table-row"] td:nth-child(3)'));
+    }
+    setInput('[data-testid="table-search"]', "");
+    await waitFor(() => !text('[data-testid="table-total"]').includes("filtradas"), "quitar el filtro");
+  });
+
+  await check("al pulsar una fila se abre su detalle y se cierra al repetir", async () => {
+    qa('[data-testid="table-row"]')[0].click();
+    await waitFor(() => q('[data-testid="row-detail"]'), "el detalle de fila");
+    if (!text('[data-testid="row-detail"]').includes("ACADEMY DINOSAUR")) {
+      throw new Error(text('[data-testid="row-detail"]'));
+    }
+    qa('[data-testid="table-row"]')[0].click();
+    await waitGone('[data-testid="row-detail"]', "el detalle");
+  });
+
+  await check("la pestaña Estructura muestra columnas y claves", async () => {
+    await click('[data-testid="tbl-tab-structure"]');
+    await waitFor(() => qa('[data-testid="structure-table"] tbody tr').length >= 13, "las columnas");
+    const content = text('[data-testid="structure-table"]');
+    if (!content.includes("film_id") || !content.includes("PK")) throw new Error("faltan columnas o PK");
+  });
+
+  await check("la pestaña Índices lista los índices reales", async () => {
+    await click('[data-testid="tbl-tab-indexes"]');
+    await waitFor(() => qa('[data-testid="index-card"]').length >= 2, "los índices");
+    if (!text('[data-testid="table-modal"]').includes("PRIMARY")) throw new Error("falta PRIMARY");
+  });
+
+  await check("la pestaña SQL genera un SELECT y el DDL", async () => {
+    await click('[data-testid="tbl-tab-sql"]');
+    await waitFor(() => text('[data-testid="sql-preview"]').includes("SELECT *"), "el SELECT");
+    await waitFor(() => text('[data-testid="ddl-preview"]').includes("CREATE TABLE"), "el DDL");
+  });
+
+  await check("abrir la tabla en el editor crea una pestaña reutilizable", async () => {
+    const before = qa('[data-testid="tab"]').length;
+    await click('[data-testid="open-table-sql"]');
+    await waitGone('[data-testid="table-modal"]', "el inspector");
+    await waitFor(() => qa('[data-testid="tab"]').length === before + 1, "la pestaña nueva");
+    if (!text('[data-testid="tab"][data-active="true"]').includes("sakila.film")) {
+      throw new Error(text('[data-testid="tab"][data-active="true"]'));
+    }
+    await waitFor(() => qa(".data-grid tbody tr").length > 5, "la vista previa en la pestaña");
+
+    await expandSakila();
+    await click('[data-testid="table-node"][data-table="film"]');
+    await waitFor(() => q('[data-testid="table-modal"]'), "el inspector de nuevo");
+    await waitFor(() => q('[data-testid="table-row"]'), "las filas del inspector");
+    const current = qa('[data-testid="tab"]').length;
+    await click('[data-testid="open-table-sql"]');
+    await waitGone('[data-testid="table-modal"]', "el inspector duplicado");
+    await sleep(250);
+    if (qa('[data-testid="tab"]').length !== current) {
+      throw new Error("se ha duplicado la pestaña de la misma tabla");
+    }
+  });
+
+  await check("Escape cierra el inspector", async () => {
+    await openFilm();
+    await press("Escape");
+    await waitGone('[data-testid="table-modal"]', "el inspector con Escape");
+  });
+
+  /* ----------------------------------------------------------------- mapa */
+  await check("el mapa dibuja 23 tablas y sus 22 relaciones", async () => {
+    await click('[data-testid="map-btn"]');
+    await waitFor(() => q('[data-testid="map-modal"]'), "el mapa");
+    await waitFor(() => qa('[data-testid="map-node"]').length === 23, "las 23 tablas");
+    await waitFor(() => qa('[data-testid="map-edge"]').length >= 20, "las aristas");
+    if (!text('[data-testid="map-modal"]').includes("sakila")) throw new Error("no abrió en sakila");
+  });
+
+  await check("al pulsar una tabla se ve su detalle y sus relaciones", async () => {
+    const node = q('[data-testid="map-node"][data-table="rental"]');
+    fire(node);
+    await waitFor(() => q('[data-testid="map-side"]'), "el panel lateral");
+    const content = text('[data-testid="map-side"]');
+    if (!content.includes("rental") || !content.includes("inventory_id")) {
+      throw new Error(content.slice(0, 120));
+    }
+    if (!content.includes("rental.inventory_id")) throw new Error("faltan las relaciones entrantes");
+  });
+
+  await check("el zoom del mapa cambia la escala", async () => {
+    const before = text('[data-testid="map-zoom"]');
+    await click('[data-testid="map-zoom-in"]');
+    await waitFor(() => text('[data-testid="map-zoom"]') !== before, "el nuevo zoom");
+  });
+
+  await check("las columnas y las tablas sin relaciones se pueden ocultar", async () => {
+    await click('[data-testid="map-toggle-columns"]');
+    await waitFor(() => qa(".col-name").length === 0, "ocultar las columnas");
+    await click('[data-testid="map-toggle-columns"]');
+    await waitFor(() => qa(".col-name").length > 0, "volver a mostrar las columnas");
+    const total = qa('[data-testid="map-node"]').length;
+    await click('[data-testid="map-only-related"]');
+    await waitFor(() => qa('[data-testid="map-node"]').length < total, "filtrar las aisladas");
+    await click('[data-testid="map-only-related"]');
+  });
+
+  await check("desde el mapa se abren los datos de la tabla", async () => {
+    await click('[data-testid="map-inspect"]');
+    await waitGone('[data-testid="map-modal"]', "el mapa");
+    await waitFor(() => q('[data-testid="table-modal"]'), "el inspector desde el mapa");
+    await closeInspector();
+  });
+
+  await check("el mapa cambia de base y redibuja", async () => {
+    await click('[data-testid="map-btn"]');
+    await waitFor(() => q('[data-testid="map-modal"]'), "el mapa de nuevo");
+    await click('[data-testid="map-db"][data-db="classicmodels"]');
+    await waitFor(
+      () => qa('[data-testid="map-node"]').length >= 8 && qa('[data-testid="map-node"]').length < 15,
+      "las tablas de classicmodels",
+    );
+    await waitFor(() => qa('[data-testid="map-edge"]').length >= 5, "las relaciones de classicmodels");
+    await click('[data-testid="map-modal"] [data-testid="modal-close"]');
+    await waitGone('[data-testid="map-modal"]', "el mapa");
+  });
+
+  /* --------------------------------------------------------------- paleta */
+  await check("Ctrl+P abre la paleta de comandos", async () => {
+    await press("p", { ctrlKey: true });
+    await waitFor(() => q('[data-testid="palette"]'), "la paleta");
+    if (qa('[data-testid="palette-item"]').length < 7) throw new Error("pocas acciones");
+  });
+
+  await check("la paleta encuentra una tabla y la abre", async () => {
+    setInput('[data-testid="palette-input"]', "sakila.film");
+    const item = await waitFor(
+      () => qa('[data-testid="palette-item"][data-kind="table"]').find((node) => node.textContent.includes("sakila.film")),
+      "la tabla sakila.film en la paleta",
+    );
+    fire(item);
+    await waitGone('[data-testid="palette"]', "la paleta");
+    await waitFor(() => q('[data-testid="table-modal"]'), "el inspector desde la paleta");
+    await closeInspector();
+  });
+
+  await check("el historial guarda la consulta ejecutada", async () => {
+    await runQuery("SELECT 2024 AS anio_historial;", "2024");
+    await press("p", { ctrlKey: true });
+    await waitFor(() => q('[data-testid="palette"]'), "la paleta");
+    setInput('[data-testid="palette-input"]', "anio_historial");
+    const item = await waitFor(
+      () => qa('[data-testid="palette-item"][data-kind="history"]')[0],
+      "la consulta reciente",
+    );
+    fire(item);
+    await waitGone('[data-testid="palette"]', "la paleta");
+    await waitFor(
+      () => win().__cmView.state.doc.toString().includes("anio_historial"),
+      "la consulta recuperada en el editor",
+    );
+  });
+
+  /* -------------------------------------------------------------- pestañas */
+  await check("las pestañas se desplazan sin romper el ancho de la página", async () => {
+    for (let index = 0; index < 9; index += 1) {
+      await click('[data-testid="new-tab"]');
+      await sleep(50);
+    }
+    await waitFor(() => qa('[data-testid="tab"]').length >= 10, "diez pestañas");
+    const view = win();
+    if (view.document.documentElement.scrollWidth > view.innerWidth + 2) {
+      throw new Error(
+        `desborda: ${view.document.documentElement.scrollWidth} > ${view.innerWidth}`,
+      );
+    }
+    await waitFor(() => {
+      const strip = q('[data-testid="tabs"]').getBoundingClientRect();
+      const active = q('[data-testid="tab"][data-active="true"]').getBoundingClientRect();
+      return active.right <= strip.right + 3 && active.left >= strip.left - 3;
+    }, "la pestaña activa visible dentro de la tira");
+  });
+
+  await check("el menú de pestañas lista y cambia de pestaña", async () => {
+    const tabs = qa('[data-testid="tab"]');
+    const targetId = tabs[0].dataset.tabId;
+    await click('[data-testid="tab-menu-btn"]');
+    await waitFor(() => q('[data-testid="tab-menu"]'), "el menú de pestañas");
+    const rows = qa('[data-testid="tab-menu-item"]');
+    if (rows.length !== tabs.length) throw new Error(`${rows.length} filas para ${tabs.length} pestañas`);
+    fire(rows[0]);
+    await waitFor(
+      () => q(`[data-testid="tab"][data-tab-id="${targetId}"]`).dataset.active === "true",
+      "la primera pestaña activa",
+    );
+  });
+
+  await check("Ctrl+Shift+M abre el mapa de la base activa", async () => {
+    await press("M", { ctrlKey: true, shiftKey: true });
+    await waitFor(() => q('[data-testid="map-modal"]'), "el mapa por atajo");
+    await click('[data-testid="map-modal"] [data-testid="modal-close"]');
+    await waitGone('[data-testid="map-modal"]', "el mapa");
+  });
+
+  await check("limpiar la salida deja el panel vacío", async () => {
+    await click('[data-testid="clear-output"]');
+    await waitFor(() => text('[data-testid="output"]').includes("Ejecuta una consulta"), "el estado vacío");
+  });
+
+  await check("cambiar la base de la pestaña se refleja en el selector", async () => {
+    setSelect('[data-testid="db-select"]', "sakila");
+    await waitFor(() => q('[data-testid="db-select"]').value === "sakila", "el valor sakila");
+  });
+
+  summary.textContent = `RESULTADO ${passed} correctas, ${failed} fallidas`;
+  out(failed === 0 ? "pass" : "fail", `RESULTADO ${passed} correctas, ${failed} fallidas`);
+}
+
+main().catch((problem) => {
+  failed += 1;
+  out("fail", `FAIL · arnés interrumpido → ${problem && problem.message ? problem.message : problem}`);
+  summary.textContent = `RESULTADO ${passed} correctas, ${failed} fallidas`;
+});
+</script>
+</body>
+</html>

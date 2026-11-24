@@ -1,0 +1,16 @@
+# Secretos y datos locales
+.env
+volumen/
+historial/
+config/
+
+# Dependencias y cachés
+node_modules/
+__pycache__/
+*.py[cod]
+*.log
+
+# Sistema / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,791 @@
+#!/usr/bin/env bash
+# sql-lab — laboratorio SQL local con un único contenedor MySQL 8.4.
+#
+# Todo vive en esta carpeta:
+#   volumen/    datos de MySQL (persistente, sobrevive a stop/start)
+#   sql/        ficheros .sql que quieras cargar
+#   historial/  historial del cliente y exportaciones
+#   config/     credenciales generadas (permisos 600)
+#
+# Uso:  ./sql-lab <comando> [args]
+set -euo pipefail
+
+# Resuelve enlaces simbolicos: el script funciona igual desde esta carpeta o
+# instalado como comando global (/usr/local/bin/sql-lab).
+_SELF="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+BASE="$(cd -- "$(dirname -- "$_SELF")" && pwd)"
+PROG="$(basename -- "${BASH_SOURCE[0]}")"
+unset _SELF
+CONTAINER="sql-lab"
+IMAGE="mysql:8.4"
+CONFIG_DIR="$BASE/config"
+ENV_FILE="$BASE/.env"
+VOL_DIR="$BASE/volumen"
+SQL_DIR="$BASE/sql"
+HIST_DIR="$BASE/historial"
+HIST_FILE="$HIST_DIR/mysql_history"
+LAST_DB_FILE="$HIST_DIR/.ultima_base"
+NANO_RC="$CONFIG_DIR/nano/nanorc"
+DEFAULT_SCRIPT="$SQL_DIR/consulta.sql"
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  GREEN=$'\033[32m' YELLOW=$'\033[33m' RED=$'\033[31m' BOLD=$'\033[1m' RESET=$'\033[0m'
+else
+  GREEN="" YELLOW="" RED="" BOLD="" RESET=""
+fi
+
+info() { printf '%s==>%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%saviso:%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+die() { printf '%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+${BOLD}sql-lab${RESET} — MySQL 8.4 de prácticas en un único contenedor
+
+  ${BOLD}start${RESET}                  arranca el contenedor (lo crea la primera vez) y espera a MySQL
+  ${BOLD}stop${RESET}                   para el contenedor sin tocar los datos
+  ${BOLD}restart${RESET}                reinicia el contenedor
+  ${BOLD}status${RESET}                 estado, bases de datos y número de objetos
+  ${BOLD}shell [base]${RESET}           abre el cliente mysql (historial persistente)
+  ${BOLD}edit [base] [fichero.sql]${RESET}
+                          abre nano con resaltado SQL y al salir ejecuta todo el fichero
+  ${BOLD}run <fichero.sql> [base]${RESET}
+                          ejecuta el fichero completo y muestra el resultado o el error
+                          ('-' lee el script de la entrada estándar)
+  ${BOLD}test [fichero.test.sql] [base]${RESET}
+                          ejecuta casos '-- @test:' y comprueba los SIGNAL y las salidas
+                          (sin fichero: todos los sql/tests/*.sql)
+  ${BOLD}load <fichero.sql>...${RESET}  crea la base y ejecuta el/los fichero(s)
+  ${BOLD}list${RESET}                   lista las bases de datos de usuario
+  ${BOLD}tables <base>${RESET}          lista tablas y vistas de una base
+  ${BOLD}history${RESET}                muestra lo ejecutado en la shell
+  ${BOLD}history export [ruta]${RESET}  guarda una copia fechada del historial (opcional)
+  ${BOLD}logs${RESET}                   últimas líneas del log de MySQL
+  ${BOLD}install [nombre]${RESET}       instala el comando global (por defecto: sql-lab)
+  ${BOLD}uninstall [nombre]${RESET}     desinstala el comando global
+
+La base de destino de 'load' se deduce del propio fichero:
+  CREATE DATABASE / USE ... y, si no hay ninguno, del nombre del fichero.
+EOF
+}
+
+# --------------------------------------------------------------------------- #
+# Configuración y contenedor
+# --------------------------------------------------------------------------- #
+
+load_env() {
+  [ -f "$ENV_FILE" ] || die "falta $ENV_FILE (ejecuta '$PROG start')."
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+}
+
+ensure_dirs() {
+  mkdir -p "$VOL_DIR" "$SQL_DIR" "$HIST_DIR" "$CONFIG_DIR"
+}
+
+ensure_config() {
+  ensure_dirs
+  if [ ! -f "$ENV_FILE" ]; then
+    local pass
+    pass="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)"
+    [ -n "$pass" ] || die "no se pudo generar la contraseña de root."
+    ( umask 077; printf 'MYSQL_ROOT_PASSWORD=%s\nMYSQL_PORT=%s\nSQL_STUDIO_PORT=%s\n' \
+        "$pass" "${SQL_LAB_PORT:-3306}" "${SQL_STUDIO_PORT:-8765}" > "$ENV_FILE" )
+    info "Credenciales generadas en $ENV_FILE (chmod 600)"
+  fi
+  load_env
+}
+
+container_exists() { docker container inspect "$CONTAINER" >/dev/null 2>&1; }
+
+compose_available() {
+  [ -f "$BASE/docker-compose.yml" ] && docker compose version >/dev/null 2>&1
+}
+
+is_running() {
+  [ "$(docker container inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" = "true" ]
+}
+
+wait_ready() {
+  for _ in $(seq 1 90); do
+    if docker exec "$CONTAINER" mysqladmin ping -h 127.0.0.1 --silent >/dev/null 2>&1; then
+      info "MySQL listo en 127.0.0.1:${MYSQL_PORT}"
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs --tail 20 "$CONTAINER" >&2 || true
+  die "MySQL no respondió en 90 s."
+}
+
+start_container() {
+  ensure_config
+  if container_exists; then
+    if is_running; then
+      info "El contenedor '$CONTAINER' ya estaba en marcha."
+    else
+      docker start "$CONTAINER" >/dev/null
+      info "Contenedor '$CONTAINER' arrancado."
+    fi
+  else
+    if compose_available; then
+      ( cd "$BASE" && docker compose up -d ) >/dev/null
+      info "Contenedor '$CONTAINER' creado con docker compose."
+    else
+      docker run -d --name "$CONTAINER" \
+        --restart unless-stopped \
+        --label sql-lab=1 \
+        --env-file "$ENV_FILE" \
+        -e "MYSQL_ROOT_HOST=%" \
+        -p "127.0.0.1:${MYSQL_PORT}:3306" \
+        -v "$VOL_DIR:/var/lib/mysql" \
+        -v "$SQL_DIR:/lab/sql:ro" \
+        -v "$HIST_DIR:/lab/historial" \
+        --health-cmd "mysqladmin ping -h 127.0.0.1 --silent" \
+        --health-interval 5s --health-retries 20 \
+        "$IMAGE" >/dev/null
+      info "Contenedor '$CONTAINER' creado con docker run."
+    fi
+  fi
+  wait_ready
+}
+
+require_running() {
+  load_env
+  container_exists || die "el contenedor no existe todavía; ejecuta '$PROG start'."
+  is_running || die "el contenedor está parado; ejecuta '$PROG start'."
+}
+
+# --------------------------------------------------------------------------- #
+# Utilidades SQL
+# --------------------------------------------------------------------------- #
+
+# Cliente con el historial dirigido a historial/mysql_history y ejecutado con
+# el UID del usuario para que los ficheros del historial sean suyos.
+client() {
+  docker exec -i --user "$(id -u):$(id -g)" \
+    -e "MYSQL_PWD=$MYSQL_ROOT_PASSWORD" \
+    -e "HOME=/lab/historial" \
+    -e "MYSQL_HISTFILE=/lab/historial/mysql_history" \
+    "$CONTAINER" mysql -s -u root --default-character-set=utf8mb4 "$@"
+}
+
+client_tty() {
+  docker exec -it --user "$(id -u):$(id -g)" \
+    -e "MYSQL_PWD=$MYSQL_ROOT_PASSWORD" \
+    -e "HOME=/lab/historial" \
+    -e "MYSQL_HISTFILE=/lab/historial/mysql_history" \
+    "$CONTAINER" mysql -u root --auto-rehash --default-character-set=utf8mb4 "$@"
+}
+
+# Cliente con salida en tabla, para 'run' y 'edit' (se ve el resultado de cada SELECT).
+client_table() {
+  docker exec -i --user "$(id -u):$(id -g)" \
+    -e "MYSQL_PWD=$MYSQL_ROOT_PASSWORD" \
+    -e "HOME=/lab/historial" \
+    "$CONTAINER" mysql -t -u root --show-warnings --default-character-set=utf8mb4 "$@"
+}
+
+# Consulta interna como root (sin historial ni tty).
+sql_query() {
+  docker exec -e "MYSQL_PWD=$MYSQL_ROOT_PASSWORD" "$CONTAINER" \
+    mysql -N -B --default-character-set=utf8mb4 -e "$1"
+}
+
+user_databases() {
+  sql_query "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA
+             WHERE SCHEMA_NAME NOT IN ('mysql','information_schema','performance_schema','sys')
+             ORDER BY SCHEMA_NAME;"
+}
+
+# Nombre de la base: CREATE DATABASE/SCHEMA del fichero, luego USE, luego el
+# nombre del fichero saneado.
+detect_db() {
+  local file="$1" name=""
+  name="$(grep -i -m1 -oP '^\s*CREATE\s+(DATABASE|SCHEMA)\s+(IF\s+NOT\s+EXISTS\s+)?\K`?[A-Za-z0-9_$]+`?' "$file" 2>/dev/null | tr -d '`' || true)"
+  if [ -z "$name" ]; then
+    name="$(grep -i -m1 -oP '^\s*USE\s+\K`?[A-Za-z0-9_$]+`?' "$file" 2>/dev/null | tr -d '`' || true)"
+  fi
+  if [ -z "$name" ]; then
+    name="$(basename -- "$file" .sql | tr -c 'A-Za-z0-9_' '_' | sed -E 's/_+/_/g; s/^_//; s/_$//')"
+    [ -n "$name" ] || name="lab"
+  fi
+  printf '%s' "${name:0:64}"
+}
+
+create_db() {
+  sql_query "CREATE DATABASE IF NOT EXISTS \`$1\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" >/dev/null
+  info "Base de datos '$1' lista."
+}
+
+show_objects() {
+  local rows
+  rows="$(sql_query "SELECT CONCAT(TABLE_TYPE, '  ', TABLE_NAME) FROM information_schema.TABLES
+                     WHERE TABLE_SCHEMA='$1' ORDER BY TABLE_NAME;")"
+  if [ -n "$rows" ]; then
+    printf '%s\n' "$rows" | sed 's/^/    /'
+    info "$(printf '%s\n' "$rows" | grep -c .) objeto(s) en '$1'."
+  else
+    warn "La base '$1' está vacía (¿el .sql no creaba tablas?)."
+  fi
+}
+
+# --------------------------------------------------------------------------- #
+# Comandos
+# --------------------------------------------------------------------------- #
+
+cmd_start() { start_container; }
+
+cmd_stop() {
+  container_exists || die "el contenedor no existe."
+  if is_running; then
+    docker stop "$CONTAINER" >/dev/null
+    info "Contenedor parado. Los datos siguen en volumen/."
+  else
+    info "El contenedor ya estaba parado."
+  fi
+}
+
+cmd_restart() {
+  container_exists || die "el contenedor no existe todavía; ejecuta '$PROG start'."
+  docker restart "$CONTAINER" >/dev/null
+  info "Contenedor reiniciado."
+  wait_ready
+}
+
+cmd_status() {
+  ensure_dirs
+  if ! container_exists; then
+    printf 'Contenedor: no creado (usa %s start)\n' "$PROG"
+    return 0
+  fi
+  load_env
+  local running started
+  running="$(docker container inspect -f '{{.State.Running}}' "$CONTAINER")"
+  started="$(docker container inspect -f '{{.State.StartedAt}}' "$CONTAINER")"
+  printf 'Contenedor:    %s (%s)\n' "$CONTAINER" "$([ "$running" = true ] && echo "en marcha" || echo "parado")"
+  printf 'Imagen:        %s\n' "$IMAGE"
+  printf 'Puerto:        %s\n' "$([ "$running" = true ] && echo "127.0.0.1:${MYSQL_PORT} (solo local)" || echo "-")"
+  printf 'Iniciado:      %s\n' "$started"
+  printf 'Datos:         %s\n' "$VOL_DIR"
+  printf 'Ficheros .sql: %s\n' "$SQL_DIR"
+  printf 'Historial:     %s\n' "$HIST_FILE"
+  if [ "$running" = true ]; then
+    printf '\nBases de datos:\n'
+    local dbs
+    dbs="$(user_databases)"
+    [ -n "$dbs" ] || { printf '    (ninguna todavía; usa load)\n'; return 0; }
+    printf '%s\n' "$dbs" | while IFS= read -r db; do
+      printf '    %-30s %s objetos\n' "$db" "$(sql_query "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='$db';")"
+    done
+  fi
+}
+
+cmd_list() {
+  require_running
+  local dbs
+  dbs="$(user_databases)"
+  if [ -z "$dbs" ]; then
+    printf '(no hay bases de datos de usuario)\n'
+  else
+    printf '%s\n' "$dbs"
+  fi
+}
+
+cmd_tables() {
+  [ $# -ge 1 ] || die "uso: $PROG tables <base>"
+  require_running
+  printf 'Tablas y vistas de %s:\n' "$1"
+  show_objects "$1"
+}
+
+cmd_shell() {
+  require_running
+  if [ $# -ge 1 ] && [ -n "$1" ]; then
+    info "Cliente MySQL en la base '$1' (salir: exit o Ctrl-D)."
+    client_tty "$1"
+  else
+    info "Cliente MySQL (salir: exit o Ctrl-D). Historial en historial/mysql_history"
+    client_tty
+  fi
+}
+
+cmd_load() {
+  [ $# -ge 1 ] || die "uso: $PROG load <fichero.sql> [más ficheros...]"
+  require_running
+  local file db rc=0 err
+  for file in "$@"; do
+    if [ -d "$file" ]; then
+      warn "'$file' es un directorio; pasa ficheros: $PROG load $file/*.sql"
+      rc=1
+      continue
+    fi
+    [ -f "$file" ] || die "no existe el fichero: $file"
+    db="$(detect_db "$file")"
+    info "Cargando '$(basename -- "$file")' en la base '$db'…"
+    create_db "$db" >/dev/null
+    info "Base de datos '$db' lista."
+    err="$(mktemp)"
+    # La base ya está creada: se vuelve idempotente el CREATE DATABASE del
+    # propio fichero para poder recargarlo sin error 1007.
+    if sed -E 's/^[[:space:]]*CREATE[[:space:]]+(DATABASE|SCHEMA)[[:space:]]+(IF[[:space:]]+NOT[[:space:]]+EXISTS[[:space:]]+)?`?([A-Za-z0-9_$]+)`?(.*)$/CREATE DATABASE IF NOT EXISTS \3\4/I' "$file" \
+         | client "$db" >/dev/null 2>"$err"; then
+      rm -f "$err"
+      info "Carga correcta de '$(basename -- "$file")'."
+      show_objects "$db"
+    else
+      warn "Falló la carga de '$(basename -- "$file")'. Últimas líneas:"
+      tail -n 20 "$err" >&2
+      rm -f "$err"
+      rc=1
+    fi
+    echo
+  done
+  return "$rc"
+}
+
+cmd_history() {
+  local action="${1:-show}"
+  command -v date >/dev/null || true
+  case "$action" in
+    show)
+      [ -f "$HIST_FILE" ] || die "todavía no hay historial (usa '$PROG shell')."
+      cat "$HIST_FILE"
+      ;;
+    export)
+      [ -f "$HIST_FILE" ] || die "todavía no hay historial (usa '$PROG shell')."
+      local dest="${2:-$HIST_DIR/historial-$(date +%Y%m%d-%H%M%S).txt}"
+      mkdir -p -- "$(dirname -- "$dest")"
+      cp -- "$HIST_FILE" "$dest"
+      chmod 600 -- "$dest"
+      info "Historial exportado en $dest"
+      ;;
+    *)
+      die "uso: $PROG history [export [ruta]]"
+      ;;
+  esac
+}
+
+# --------------------------------------------------------------------------- #
+# Modo editor (nano con resaltado SQL) y ejecución de un script completo
+# --------------------------------------------------------------------------- #
+
+last_db() {
+  if [ -f "$LAST_DB_FILE" ]; then
+    head -n 1 "$LAST_DB_FILE"
+  fi
+}
+
+# nanorc propio: no se toca ~/.nanorc ni /etc/nanorc.
+ensure_nanorc() {
+  mkdir -p -- "$(dirname -- "$NANO_RC")"
+  [ -f "$NANO_RC" ] && return 0
+  cat > "$NANO_RC" <<'NANORC'
+## nanorc del laboratorio SQL (lo usa: ./sql-lab edit)
+include "/usr/share/nano/*.nanorc"
+
+set linenumbers   # números de línea
+set softwrap      # las líneas largas se ajustan a la ventana (no parte la línea real)
+set tabsize 4
+set autoindent
+set mouse
+set indicator
+set constantshow  # muestra fila/columna
+set historylog
+set unix
+NANORC
+}
+
+# $SQL_LAB_EDITOR > $VISUAL > $EDITOR > nano > vim > vi
+pick_editor() {
+  local ed="${SQL_LAB_EDITOR:-${VISUAL:-${EDITOR:-}}}"
+  if [ -n "$ed" ]; then printf '%s' "$ed"; return 0; fi
+  local candidate
+  for candidate in nano vim vi; do
+    if command -v "$candidate" >/dev/null 2>&1; then printf '%s' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+open_editor() {
+  local file="$1" ed rc=0
+  ed="$(pick_editor)" || die "no encuentro nano, vim ni vi; define SQL_LAB_EDITOR."
+  local -a cmd=()
+  read -r -a cmd <<< "$ed"
+  if [ "${cmd[0]##*/}" = "nano" ]; then
+    ensure_nanorc
+    "${cmd[@]}" --rcfile "$NANO_RC" -Y sql -- "$file" || rc=$?
+  else
+    "${cmd[@]}" -- "$file" || rc=$?
+  fi
+  [ "$rc" -eq 0 ] || warn "El editor terminó con código $rc."
+  return 0
+}
+
+write_template() {
+  cat > "$1" <<'SQLEOF'
+-- Práctica de SQL — escribe aquí tus sentencias.
+-- Guarda con Ctrl-O y sal con Ctrl-X: al salir se te ofrecerá ejecutar todo
+-- el fichero. También puedes lanzarlo cuando quieras con:
+--     ./sql-lab run <este_fichero> <base>
+SQLEOF
+}
+
+# Pregunta sí/no. Sin terminal (tuberías, scripts) devuelve el valor por defecto.
+ask() {
+  local question="$1" default="${2:-S}" answer
+  if [ ! -t 0 ]; then
+    [ "$default" = "S" ]
+    return
+  fi
+  printf '%s' "$question"
+  read -r answer || answer=""
+  answer="${answer:-$default}"
+  case "$answer" in [SsYy]*) return 0 ;; *) return 1 ;; esac
+}
+
+cmd_edit() {
+  local db="" file="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      *.sql | */*) file="$arg" ;;
+      *) db="$arg" ;;
+    esac
+  done
+  if [ -z "$file" ]; then
+    file="$DEFAULT_SCRIPT"
+  else
+    case "$file" in */*) : ;; *) file="$SQL_DIR/$file" ;; esac
+  fi
+  require_running
+  mkdir -p -- "$(dirname -- "$file")"
+  if [ ! -e "$file" ]; then
+    write_template "$file"
+    info "Creado $file"
+  fi
+  if [ -z "$db" ]; then db="$(last_db)"; fi
+
+  local again=1
+  while [ "$again" = 1 ]; do
+    open_editor "$file"
+    if ! grep -q '[^[:space:]]' "$file" 2>/dev/null; then
+      warn "El fichero está vacío; no hay nada que ejecutar."
+    elif ask "¿Ejecutar '$(basename -- "$file")'? [S/n] " S; then
+      echo
+      cmd_run "$file" ${db:+"$db"} || true
+    fi
+    if ask "¿Volver al editor? [s/N] " N; then again=1; else again=0; fi
+  done
+  return 0
+}
+
+# Ejecuta el fichero completo con salida en tabla; devuelve el código de MySQL.
+cmd_run() {
+  local file="" db="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      - | *.sql | */*) file="$arg" ;;
+      *) db="$arg" ;;
+    esac
+  done
+  if [ -z "$file" ]; then
+    die "uso: $PROG run <fichero.sql> [base]   ('-' lee el script de la entrada estándar)"
+  fi
+  require_running
+
+  local tmp=""
+  if [ "$file" = "-" ]; then
+    tmp="$(mktemp)"
+    cat > "$tmp"
+    file="$tmp"
+  fi
+  [ -f "$file" ] || die "no existe el fichero: $file"
+  if ! grep -q '[^[:space:]]' "$file" 2>/dev/null; then
+    warn "El fichero está vacío; nada que ejecutar."
+    [ -n "$tmp" ] && rm -f "$tmp"
+    return 0
+  fi
+
+  local createdb="" use=""
+  createdb="$(grep -i -m1 -oP '^\s*CREATE\s+(DATABASE|SCHEMA)\s+(IF\s+NOT\s+EXISTS\s+)?\K`?[A-Za-z0-9_$]+`?' "$file" 2>/dev/null | tr -d '`' || true)"
+  use="$(grep -i -m1 -oP '^\s*USE\s+\K`?[A-Za-z0-9_$]+`?' "$file" 2>/dev/null | tr -d '`' || true)"
+  if [ -z "$db" ]; then db="${use:-$createdb}"; fi
+  if [ -z "$db" ]; then db="$(last_db)"; fi
+  if [ -z "$db" ]; then
+    local dbs
+    dbs="$(user_databases | paste -sd' ' - || true)"
+    [ -n "$tmp" ] && rm -f "$tmp"
+    die "no sé sobre qué base ejecutar; indica una: $PROG run $file <base>   (bases: ${dbs:-ninguna})"
+  fi
+  if [ -n "$createdb" ]; then create_db "$createdb" >/dev/null; fi
+
+  info "Ejecutando '$(basename -- "$file")' en la base '$db'…"
+  local err t0 dt rc=0
+  err="$(mktemp)"
+  t0="$(date +%s%3N)"
+  if client_table "$db" < "$file" 2>"$err"; then rc=0; else rc=$?; fi
+  dt=$(( $(date +%s%3N) - t0 ))
+
+  if [ -s "$err" ]; then
+    if [ "$rc" -eq 0 ]; then
+      warn "MySQL devolvió avisos:"
+    else
+      warn "MySQL devolvió un error:"
+    fi
+    sed 's/^/    /' "$err" >&2
+  fi
+  if [ "$rc" -eq 0 ]; then
+    info "Script ejecutado sin errores (${dt} ms)."
+  else
+    warn "El script se detuvo en el primer error (código $rc, ${dt} ms)."
+  fi
+
+  rm -f "$err"
+  [ -n "$tmp" ] && rm -f "$tmp"
+  printf '%s\n' "$db" > "$LAST_DB_FILE" 2>/dev/null || true
+  return "$rc"
+}
+
+# --------------------------------------------------------------------------- #
+# Banco de pruebas: casos declarativos dentro de un .sql
+#
+#   -- @test: nombre            empieza un caso
+#   -- @expect-ok               el caso debe terminar sin error (por defecto)
+#   -- @expect-error: 45000 txt debe fallar con ese SQLSTATE y (opcional) ese texto
+#   -- @expect-output: txt      la salida debe contener ese texto
+#
+# Todo lo anterior al primer '-- @test:' es el preámbulo: se ejecuta una vez
+# (tablas, PROCEDURE, TRIGGER...). Cada caso se lanza en su propio cliente
+# mysql, así un SIGNAL no detiene el resto de pruebas.
+# --------------------------------------------------------------------------- #
+
+# Quita los espacios del principio.
+trim() { local v="$1"; v="${v#"${v%%[![:space:]]*}"}"; printf '%s' "$v"; }
+
+# Divide el .sql en preámbulo y un fichero por caso. Imprime el nº de casos.
+split_tests() {
+  local file="$1" dir="$2" line n=0 current=""
+  : > "$dir/preamble.sql"
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" =~ ^[[:space:]]*--[[:space:]]*@test:(.*)$ ]]; then
+      n=$((n + 1))
+      current="$dir/caso_$(printf '%02d' "$n").sql"
+      printf '%s\n' "$line" > "$current"
+      continue
+    fi
+    if [ -z "$current" ]; then
+      printf '%s\n' "$line" >> "$dir/preamble.sql"
+    else
+      printf '%s\n' "$line" >> "$current"
+    fi
+  done < "$file"
+  printf '%s' "$n"
+}
+
+# Ejecuta un caso y devuelve 0 si cumple lo esperado.
+run_test_case() {
+  local file="$1" db="$2"
+  local name expect="ok" state="" pattern="" line rest body out err rc=0
+  local -a wants=()
+  name="$(sed -n '1s/^[[:space:]]*--[[:space:]]*@test:[[:space:]]*//p' "$file")"
+  [ -n "$name" ] || name="(sin nombre)"
+
+  while IFS= read -r line; do
+    case "$line" in
+      *'@expect-error:'*)
+        expect="error"
+        rest="$(trim "${line#*@expect-error:}")"
+        state="${rest%%[[:space:]]*}"
+        pattern="$(trim "${rest#"$state"}")"
+        ;;
+      *'@expect-ok'*) expect="ok" ;;
+      *'@expect-output:'*)
+        wants+=("$(trim "${line#*@expect-output:}")")
+        ;;
+    esac
+  done < <(grep -E '^[[:space:]]*--[[:space:]]*@' "$file" 2>/dev/null || true)
+
+  body="$(mktemp)"
+  sed -E '/^[[:space:]]*--[[:space:]]*@(test|expect-ok|expect-error|expect-output)/d' "$file" > "$body"
+  out="$(mktemp)" err="$(mktemp)"
+  if client_table "$db" < "$body" > "$out" 2> "$err"; then rc=0; else rc=$?; fi
+  rm -f "$body"
+
+  local got_state="" got_msg=""
+  if [ -s "$err" ]; then
+    got_state="$(grep -oP 'ERROR [0-9]+ \(\K[0-9A-Z]{5}' "$err" | head -1 || true)"
+    got_msg="$(grep -m1 -E 'ERROR [0-9]+ \([0-9A-Z]{5}\)' "$err" | sed -E 's/^ERROR [0-9]+ \([0-9A-Z]{5}\)( at line [0-9]+)?: //' || true)"
+  fi
+
+  local ok=1 why=""
+  if [ "$expect" = "error" ]; then
+    if [ "$rc" -eq 0 ]; then
+      ok=0 why="se esperaba un error $state y terminó bien"
+    elif [ -n "$state" ] && [ "$got_state" != "$state" ]; then
+      ok=0 why="SQLSTATE esperado $state, recibido ${got_state:-ninguno}"
+    elif [ -n "$pattern" ] && [[ "$got_msg" != *"$pattern"* ]]; then
+      ok=0 why="el mensaje no contiene '$pattern' (llegó: $got_msg)"
+    else
+      why="error $got_state capturado"
+    fi
+  else
+    if [ "$rc" -ne 0 ]; then ok=0 why="se esperaba éxito y falló (${got_state:-código $rc})"; else why="sin errores"; fi
+  fi
+  local w
+  for w in ${wants[@]+"${wants[@]}"}; do
+    grep -qF -- "$w" "$out" || { ok=0; why="${why:+$why; }no aparece '$w' en la salida"; }
+  done
+
+  if [ "$ok" -eq 1 ]; then
+    printf '  %s✓%s %s %s(%s)%s\n' "$GREEN" "$RESET" "$name" "$BOLD" "$why" "$RESET"
+  else
+    printf '  %s✗%s %s %s(%s)%s\n' "$RED" "$RESET" "$name" "$BOLD" "$why" "$RESET"
+  fi
+  [ -s "$out" ] && sed 's/^/      salida │ /' "$out"
+  [ -s "$err" ] && sed 's/^/      mysql  │ /' "$err"
+  rm -f "$out" "$err"
+  [ "$ok" -eq 1 ]
+}
+
+cmd_test() {
+  local target="" db="" arg
+  for arg in "$@"; do
+    case "$arg" in
+      *.sql) target="$arg" ;;
+      *) db="$arg" ;;
+    esac
+  done
+  require_running
+  local -a files=()
+  if [ -z "$target" ]; then
+    mapfile -t files < <(find "$SQL_DIR/tests" -maxdepth 1 -type f -name '*.sql' 2>/dev/null | sort)
+    [ "${#files[@]}" -gt 0 ] || die "no hay pruebas en $SQL_DIR/tests; crea un *.test.sql o pasa un fichero"
+  else
+    [ -f "$target" ] || die "no existe el fichero: $target"
+    files=("$target")
+  fi
+
+  local total=0 ok=0 fallos=0 f fdb use createdb n dir i
+  for f in "${files[@]}"; do
+    fdb="$db"
+    if [ -z "$fdb" ]; then
+      use="$(grep -i -m1 -oP '^\s*USE\s+\K`?[A-Za-z0-9_$]+`?' "$f" 2>/dev/null | tr -d '`' || true)"
+      createdb="$(grep -i -m1 -oP '^\s*CREATE\s+(DATABASE|SCHEMA)\s+(IF\s+NOT\s+EXISTS\s+)?\K`?[A-Za-z0-9_$]+`?' "$f" 2>/dev/null | tr -d '`' || true)"
+      fdb="${use:-$createdb}"
+    fi
+    [ -n "$fdb" ] || fdb="$(last_db)"
+    if [ -z "$fdb" ]; then
+      warn "no sé en qué base ejecutar '$f'; indícala: $PROG test $f <base>"
+      fallos=$((fallos + 1))
+      continue
+    fi
+    create_db "$fdb" >/dev/null
+    dir="$(mktemp -d)"
+    n="$(split_tests "$f" "$dir")"
+    info "Pruebas de '$(basename -- "$f")' en la base '${BOLD}$fdb${RESET}' ($n caso(s))"
+    if [ "$n" -eq 0 ]; then
+      warn "no hay casos '-- @test:' en el fichero."
+      rm -rf "$dir"
+      continue
+    fi
+    if grep -q '[^[:space:]]' "$dir/preamble.sql" 2>/dev/null; then
+      if ! client "$fdb" < "$dir/preamble.sql" >/dev/null 2> "$dir/preamble.err"; then
+        warn "el preámbulo falló; no se ejecutan los casos:"
+        sed 's/^/    /' "$dir/preamble.err" >&2
+        fallos=$((fallos + 1))
+        rm -rf "$dir"
+        continue
+      fi
+    fi
+    for i in $(seq 1 "$n"); do
+      total=$((total + 1))
+      if run_test_case "$dir/caso_$(printf '%02d' "$i").sql" "$fdb"; then
+        ok=$((ok + 1))
+      else
+        fallos=$((fallos + 1))
+      fi
+    done
+    rm -rf "$dir"
+    printf '\n'
+  done
+
+  if [ "$fallos" -eq 0 ]; then
+    info "$total caso(s): ${GREEN}$ok correcto(s)${RESET}, 0 fallos."
+  else
+    warn "$total caso(s): $ok correcto(s), $fallos fallo(s)."
+  fi
+  [ "$fallos" -eq 0 ]
+}
+
+cmd_logs() {
+  container_exists || die "el contenedor no existe todavía."
+  docker logs --tail "${1:-50}" "$CONTAINER"
+}
+
+# --------------------------------------------------------------------------- #
+# Instalación como comando global (enlace en /usr/local/bin)
+# --------------------------------------------------------------------------- #
+cmd_install() {
+  local name="${1:-sql-lab}"
+  local bin_dir="${BIN_DIR:-/usr/local/bin}"
+  local self_target
+  self_target="$BASE/$(basename -- "${BASH_SOURCE[0]}")"
+  [ -f "$self_target" ] || self_target="$(readlink -f -- "${BASH_SOURCE[0]}")"
+  case "$name" in
+    *[!A-Za-z0-9._-]* | "") die "nombre no válido: '$name'" ;;
+  esac
+  [ -d "$bin_dir" ] || die "no existe el directorio $bin_dir"
+  local target="$bin_dir/$name"
+  if [ -e "$target" ] && [ ! -L "$target" ]; then
+    die "$target ya existe y no es un enlace; no lo sobreescribo"
+  fi
+  chmod +x -- "$self_target" 2>/dev/null || true
+  if [ -w "$bin_dir" ]; then
+    ln -sfn -- "$self_target" "$target"
+  else
+    sudo ln -sfn -- "$self_target" "$target" || die "no se pudo crear $target"
+  fi
+  info "Instalado: $target -> $self_target"
+  printf '  Prueba desde cualquier carpeta:  %s status\n' "$name"
+}
+
+cmd_uninstall() {
+  local name="${1:-sql-lab}"
+  local bin_dir="${BIN_DIR:-/usr/local/bin}"
+  local target="$bin_dir/$name"
+  [ -L "$target" ] || die "$target no es un enlace instalado por este script"
+  [ "$(readlink -f -- "$target")" = "$(readlink -f -- "$BASE/$(basename -- "${BASH_SOURCE[0]}")")" ] \
+    || die "$target apunta a otro sitio ($(readlink -f -- "$target")); no lo toco"
+  if [ -w "$bin_dir" ]; then
+    rm -f -- "$target"
+  else
+    sudo rm -f -- "$target"
+  fi
+  info "Eliminado: $target"
+}
+
+main() {
+  local command="${1:-}"
+  [ $# -gt 0 ] && shift || true
+  case "$command" in
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    status) cmd_status ;;
+    shell) cmd_shell "$@" ;;
+    edit) cmd_edit "$@" ;;
+    run) cmd_run "$@" ;;
+    test) cmd_test "$@" ;;
+    load) cmd_load "$@" ;;
+    list) cmd_list ;;
+    tables) cmd_tables "$@" ;;
+    history) cmd_history "$@" ;;
+    logs) cmd_logs "$@" ;;
+    install) cmd_install "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    help | -h | --help | "") usage ;;
+    *) usage >&2; die "comando desconocido: '$command'" ;;
+  esac
+}
+
+main "$@"

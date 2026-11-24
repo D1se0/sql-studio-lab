@@ -1,0 +1,10 @@
+.git
+.github
+docs
+node_modules
+app/web/node_modules
+volumen
+historial
+.env
+**/__pycache__
+**/*.pyc
